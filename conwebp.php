@@ -28,6 +28,21 @@ function conwebp_register_settings() {
         'sanitize_callback' => 'absint',
         'default'           => 1920,
     ) );
+    register_setting( 'conwebp_options_group', 'conwebp_remove_originals', array(
+        'type'              => 'integer',
+        'sanitize_callback' => 'absint',
+        'default'           => 1,
+    ) );
+    register_setting( 'conwebp_options_group', 'conwebp_update_links', array(
+        'type'              => 'integer',
+        'sanitize_callback' => 'absint',
+        'default'           => 1,
+    ) );
+    register_setting( 'conwebp_options_group', 'conwebp_update_postmeta', array(
+        'type'              => 'integer',
+        'sanitize_callback' => 'absint',
+        'default'           => 0,
+    ) );
     
     // Configurações padrão se for a primeira vez
     if ( get_option( 'conwebp_quality' ) === false ) {
@@ -64,6 +79,9 @@ function conwebp_settings_page() {
     // Busca as configurações (o absint garante que mesmo se o BD for hackeado, só retorne números seguros no HTML)
     $quality  = absint( get_option( 'conwebp_quality', 80 ) );
     $max_size = absint( get_option( 'conwebp_max_size', 1920 ) );
+    $remove_originals = absint( get_option( 'conwebp_remove_originals', 1 ) );
+    $update_links     = absint( get_option( 'conwebp_update_links', 1 ) );
+    $update_postmeta  = absint( get_option( 'conwebp_update_postmeta', 0 ) );
     ?>
     <style>
         .conwebp-wrap {
@@ -592,7 +610,10 @@ function conwebp_process_image_upload( $upload ) {
         $saved = $editor->save( $new_file_path, 'image/webp' );
 
         if ( ! is_wp_error( $saved ) ) {
-            @unlink( $file_path );
+            $remove_originals = (int) get_option( 'conwebp_remove_originals', 1 );
+            if ( $remove_originals ) {
+                @unlink( $file_path );
+            }
             $upload['file'] = $new_file_path;
             $url_parts = pathinfo( $upload['url'] );
             $upload['url'] = str_replace( $url_parts['basename'], $unique_filename, $upload['url'] );
@@ -600,12 +621,9 @@ function conwebp_process_image_upload( $upload ) {
         }
     }
 
+    // Garante que o fluxo de upload do WordPress continue normalmente
     return $upload;
 }
-
-// ----------------------------------------------------
-// 5. FAXINA TOTAL (AJAX BULK OPTIMIZER)
-// ----------------------------------------------------
 
 add_action( 'wp_ajax_conwebp_bulk_optimizer', 'conwebp_handle_bulk_ajax' );
 function conwebp_handle_bulk_ajax() {
@@ -630,7 +648,10 @@ function conwebp_handle_bulk_ajax() {
     $results = array();
 
     if ( $query->have_posts() ) {
-        $quality = (int) get_option( 'conwebp_quality', 80 );
+        $quality         = (int) get_option( 'conwebp_quality', 80 );
+        $remove_originals = (int) get_option( 'conwebp_remove_originals', 1 );
+        $update_links     = (int) get_option( 'conwebp_update_links', 1 );
+        $update_postmeta  = (int) get_option( 'conwebp_update_postmeta', 0 );
         
         while ( $query->have_posts() ) {
             $query->the_post();
@@ -647,6 +668,9 @@ function conwebp_handle_bulk_ajax() {
                 $results[] = array( 'status' => 'warning', 'msg' => "ID $id: Já é WebP. Pulado.", 'saved_bytes' => 0 );
                 continue;
             }
+
+            // URL antiga do anexo, para atualizar links no banco
+            $old_url = wp_get_attachment_url( $id );
 
             $editor = wp_get_image_editor( $file );
             if ( is_wp_error( $editor ) ) {
@@ -667,12 +691,26 @@ function conwebp_handle_bulk_ajax() {
                 // Força o WP a regenerar as miniaturas no novo formato
                 $metadata = wp_generate_attachment_metadata( $id, $new_file );
                 wp_update_attachment_metadata( $id, $metadata );
+
+                // Atualiza o mime type do anexo
+                wp_update_post( array(
+                    'ID'            => $id,
+                    'post_mime_type'=> 'image/webp',
+                ) );
                 
-                $new_size = filesize( $new_file );
+                $new_size   = filesize( $new_file );
                 $saved_bytes = max( 0, $original_size - $new_size );
 
-                // Remove original
-                @unlink( $file );
+                // Remove original apenas se configurado
+                if ( $remove_originals ) {
+                    @unlink( $file );
+                }
+
+                // Atualiza URLs em posts e metadados, se desejado
+                $new_url = str_replace( $info['basename'], $info['filename'] . '.webp', $old_url );
+                if ( $update_links || $update_postmeta ) {
+                    conwebp_replace_urls_in_database( $old_url, $new_url, (bool) $update_links, (bool) $update_postmeta );
+                }
                 
                 $results[] = array( 'status' => 'success', 'msg' => "ID $id: Otimizado com sucesso (" . $info['basename'] . ")", 'saved_bytes' => $saved_bytes );
             } else {
@@ -773,3 +811,104 @@ function conwebp_handle_hard_cleanup_ajax() {
         'results' => $results
     ));
 }
+
+// ----------------------------------------------------
+// 7. ATUALIZAÇÃO SEGURA DE LINKS NO BANCO
+// ----------------------------------------------------
+
+/**
+ * Substitui URLs antigas por novas em posts e postmeta,
+ * preservando dados serializados (page builders, etc.).
+ */
+function conwebp_replace_urls_in_database( $old_url, $new_url, $do_posts = true, $do_meta = false ) {
+    global $wpdb;
+
+    if ( empty( $old_url ) || empty( $new_url ) || $old_url === $new_url ) {
+        return;
+    }
+
+    // Atualiza posts.post_content
+    if ( $do_posts ) {
+        $like  = '%' . $wpdb->esc_like( $old_url ) . '%';
+        $posts = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT ID, post_content FROM {$wpdb->posts} WHERE post_content LIKE %s",
+                $like
+            )
+        );
+
+        if ( $posts ) {
+            foreach ( $posts as $post ) {
+                $new_content = conwebp_recursive_replace( $old_url, $new_url, $post->post_content );
+                if ( $new_content !== $post->post_content ) {
+                    $wpdb->update(
+                        $wpdb->posts,
+                        array( 'post_content' => $new_content ),
+                        array( 'ID' => $post->ID ),
+                        array( '%s' ),
+                        array( '%d' )
+                    );
+                }
+            }
+        }
+    }
+
+    // Atualiza postmeta.meta_value (incluindo dados serializados de builders)
+    if ( $do_meta ) {
+        $like  = '%' . $wpdb->esc_like( $old_url ) . '%';
+        $metas = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT meta_id, meta_value FROM {$wpdb->postmeta} WHERE meta_value LIKE %s",
+                $like
+            )
+        );
+
+        if ( $metas ) {
+            foreach ( $metas as $meta ) {
+                $new_value = conwebp_recursive_replace( $old_url, $new_url, $meta->meta_value );
+                if ( $new_value !== $meta->meta_value ) {
+                    $wpdb->update(
+                        $wpdb->postmeta,
+                        array( 'meta_value' => $new_value ),
+                        array( 'meta_id' => $meta->meta_id ),
+                        array( '%s' ),
+                        array( '%d' )
+                    );
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Faz str_replace preservando serialização de arrays/objetos.
+ */
+function conwebp_recursive_replace( $search, $replace, $data ) {
+    if ( is_array( $data ) ) {
+        foreach ( $data as $key => $value ) {
+            $data[ $key ] = conwebp_recursive_replace( $search, $replace, $value );
+        }
+        return $data;
+    }
+
+    if ( is_object( $data ) ) {
+        foreach ( $data as $key => $value ) {
+            $data->{$key} = conwebp_recursive_replace( $search, $replace, $value );
+        }
+        return $data;
+    }
+
+    // Tenta desserializar; se der certo, substitui recursivamente e serializa de volta.
+    $maybe_unserialized = maybe_unserialize( $data );
+    if ( $maybe_unserialized !== $data ) {
+        $replaced = conwebp_recursive_replace( $search, $replace, $maybe_unserialized );
+        return maybe_serialize( $replaced );
+    }
+
+    if ( is_string( $data ) ) {
+        return str_replace( $search, $replace, $data );
+    }
+
+    return $data;
+}
+
