@@ -4,7 +4,7 @@ Plugin Name: ConWebp
 Plugin URI: 
 Description: Converte automaticamente JPG, PNG e AVIF para WebP no upload. Inclui painel de configurações premium para redimensionamento inteligente e ajuste de qualidade visual.
 Version: 1.0
-Author: Bruno Maykon
+Author: Tkode Labs - Bruno Maykon
 */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -82,6 +82,11 @@ function conwebp_settings_page() {
     $remove_originals = absint( get_option( 'conwebp_remove_originals', 1 ) );
     $update_links     = absint( get_option( 'conwebp_update_links', 1 ) );
     $update_postmeta  = absint( get_option( 'conwebp_update_postmeta', 0 ) );
+
+    // Verifica suporte real a WebP no servidor
+    $webp_supported = function_exists( 'wp_image_editor_supports' )
+        ? wp_image_editor_supports( array( 'mime_type' => 'image/webp' ) )
+        : false;
     ?>
     <style>
         .conwebp-wrap {
@@ -254,6 +259,15 @@ function conwebp_settings_page() {
                 <p style="margin:0; font-size:14px;">Defina como o plugin deve se comportar durante novos uploads.</p>
             </div>
 
+            <?php if ( ! $webp_supported ) : ?>
+                <div class="notice-info-card" style="background:#fff5f5; border-left: 4px solid #e53e3e; padding: 15px; border-radius: 0 8px 8px 0; margin-bottom: 20px;">
+                    <p style="margin:0; font-size:14px; color:#742a2a;">
+                        <strong>Atenção:</strong> O servidor PHP atual não tem suporte total a WebP via GD/Imagick.
+                        As conversões podem manter as imagens em JPG/PNG. Peça à hospedagem para habilitar WebP nas extensões de imagem do PHP.
+                    </p>
+                </div>
+            <?php endif; ?>
+
             <form method="post" action="options.php">
                 <?php settings_fields( 'conwebp_options_group' ); ?>
                 <div class="conwebp-form-group">
@@ -270,6 +284,33 @@ function conwebp_settings_page() {
                     <p class="description">Imagens maiores que isso serão reduzidas. (0 = desligado)</p>
                 </div>
 
+                <div class="conwebp-form-group">
+                    <label style="display:flex; align-items:center; gap:10px;">
+                        <input type="hidden" name="conwebp_remove_originals" value="0" />
+                        <input type="checkbox" name="conwebp_remove_originals" value="1" <?php checked( $remove_originals, 1 ); ?> />
+                        <span>Remover arquivos originais (JPG/PNG/AVIF) após gerar WebP</span>
+                    </label>
+                    <p class="description">Ative se você deseja manter apenas arquivos .webp na hospedagem. Recomendado fazer backup antes.</p>
+                </div>
+
+                <div class="conwebp-form-group">
+                    <label style="display:flex; align-items:center; gap:10px;">
+                        <input type="hidden" name="conwebp_update_links" value="0" />
+                        <input type="checkbox" name="conwebp_update_links" value="1" <?php checked( $update_links, 1 ); ?> />
+                        <span>Atualizar links de imagens em posts e páginas para usar WebP</span>
+                    </label>
+                    <p class="description">Quando usado com o Otimizador em Massa, troca automaticamente as URLs antigas (.jpg/.png) pelos novos arquivos .webp no conteúdo dos posts.</p>
+                </div>
+
+                <div class="conwebp-form-group">
+                    <label style="display:flex; align-items:center; gap:10px;">
+                        <input type="hidden" name="conwebp_update_postmeta" value="0" />
+                        <input type="checkbox" name="conwebp_update_postmeta" value="1" <?php checked( $update_postmeta, 1 ); ?> />
+                        <span>Atualizar também campos avançados (postmeta, page builders, etc.)</span>
+                    </label>
+                    <p class="description">Inclui campos de construtores de página e metadados serializados. Pode levar mais tempo em bancos muito grandes.</p>
+                </div>
+
                 <?php submit_button( 'Salvar Configurações', 'conwebp-btn' ); ?>
             </form>
         </div>
@@ -278,6 +319,7 @@ function conwebp_settings_page() {
         <div id="tab-bulk" class="conwebp-card">
             <h2>Otimizador em Massa (WebP)</h2>
             <?php 
+                global $wpdb;
                 $count_query = new WP_Query(array(
                     'post_type'      => 'attachment',
                     'post_mime_type' => array('image/jpeg', 'image/png'),
@@ -286,8 +328,46 @@ function conwebp_settings_page() {
                     'fields'         => 'ids'
                 ));
                 $total_convertible = $count_query->found_posts;
+
+                // Lista de anos disponíveis para filtro (para evitar timeout em bibliotecas gigantes)
+                $years = $wpdb->get_col(
+                    "SELECT DISTINCT YEAR(post_date) FROM {$wpdb->posts}
+                     WHERE post_type = 'attachment'
+                     AND post_mime_type IN ('image/jpeg','image/png')
+                     ORDER BY YEAR(post_date) DESC"
+                );
             ?>
             <p>Esta ferramenta escaneia sua biblioteca (apenas imagens originais listadas: <strong><?php echo number_format($total_convertible, 0, ',', '.'); ?> arquivos JPEG/PNG</strong>) e recria versões ultra leves em WebP. Antigas JPEG/PNG serão substituídas preservando qualidade.</p>
+
+            <div class="conwebp-form-group" style="margin-top:15px; margin-bottom:10px;">
+                <label style="font-weight:600;">Escopo da conversão (ajuda a evitar timeout):</label>
+                <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                    <select id="conwebp_year_filter" style="min-width:140px; padding:6px 10px; border-radius:8px; border:1px solid #cbd5e0;">
+                        <option value="">Todos os anos</option>
+                        <?php if ( ! empty( $years ) ) : ?>
+                            <?php foreach ( $years as $year ) : ?>
+                                <option value="<?php echo esc_attr( $year ); ?>"><?php echo esc_html( $year ); ?></option>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </select>
+                    <select id="conwebp_month_filter" style="min-width:160px; padding:6px 10px; border-radius:8px; border:1px solid #cbd5e0;">
+                        <option value="">Todos os meses</option>
+                        <option value="1">Janeiro</option>
+                        <option value="2">Fevereiro</option>
+                        <option value="3">Março</option>
+                        <option value="4">Abril</option>
+                        <option value="5">Maio</option>
+                        <option value="6">Junho</option>
+                        <option value="7">Julho</option>
+                        <option value="8">Agosto</option>
+                        <option value="9">Setembro</option>
+                        <option value="10">Outubro</option>
+                        <option value="11">Novembro</option>
+                        <option value="12">Dezembro</option>
+                    </select>
+                    <span class="description">Você pode rodar mês a mês para reduzir o risco de timeout em hospedagens lentas.</span>
+                </div>
+            </div>
             
             <div class="bulk-status-box">
                 <div id="bulk-status-text">Pronto para iniciar a otimização.</div>
@@ -362,10 +442,27 @@ function conwebp_settings_page() {
         let errorsCount = 0;
         let savedBytes = 0;
         let totalAttachments = <?php echo isset($total_convertible) ? $total_convertible : 0; ?>;
+        let bulkYearFilter = '';
+        let bulkMonthFilter = '';
         
         $('#btn-start-bulk').on('click', function() {
             if (isRunning) return;
             isRunning = true;
+
+            // Lê filtros selecionados (ano/mês) para limitar o escopo
+            bulkYearFilter = $('#conwebp_year_filter').val();
+            bulkMonthFilter = $('#conwebp_month_filter').val();
+
+            // Reseta contadores
+            processed   = 0;
+            errorsCount = 0;
+            savedBytes  = 0;
+            $('#bulk-progress-bar').css('width', '0%');
+            $('#bulk-percentage').text('0%');
+            $('#stat-total').text('0');
+            $('#stat-errors').text('0');
+            $('#stat-saved').text('0 MB');
+
             $(this).hide();
             $('#btn-stop-bulk').show();
             $('#bulk-status-text').html('🔍 Escaneando biblioteca e convertendo...');
@@ -389,12 +486,19 @@ function conwebp_settings_page() {
                 data: {
                     action: 'conwebp_bulk_optimizer',
                     nonce: '<?php echo wp_create_nonce("conwebp_bulk_nonce"); ?>',
-                    offset: processed
+                    offset: processed,
+                    year: bulkYearFilter,
+                    month: bulkMonthFilter
                 },
                 success: function(res) {
                     if (res.success) {
+                        // Atualiza total com base no filtro quando servidor informar
+                        if (res.data.total !== undefined && res.data.total !== null) {
+                            totalAttachments = res.data.total;
+                        }
+
                         processed += res.data.count;
-                        let progress = Math.round((processed / totalAttachments) * 100);
+                        let progress = totalAttachments > 0 ? Math.round((processed / totalAttachments) * 100) : 0;
                         
                         $('#bulk-progress-bar').css('width', progress + '%');
                         $('#bulk-percentage').text(progress + '%');
@@ -442,7 +546,26 @@ function conwebp_settings_page() {
 
         function completeProcess() {
             isRunning = false;
-            $('#bulk-status-text').html('✅ <strong>Faxina Concluida!</strong> Todas as imagens foram processadas.');
+            $('#bulk-status-text').html('🔄 <strong>Otimização finalizada!</strong> Atualizando links permanentes...');
+            
+            // Chama o flush de regras via AJAX para evitar 404
+            $.ajax({
+                url: ajaxurl,
+                type: 'POST',
+                data: {
+                    action: 'conwebp_flush_rules',
+                    nonce: '<?php echo wp_create_nonce("conwebp_bulk_nonce"); ?>'
+                },
+                success: function(res) {
+                    $('#bulk-status-text').html('✅ <strong>Sucesso Total!</strong> Imagens convertidas e links atualizados.');
+                    addLog('Links permanentes atualizados com sucesso.', 'success');
+                },
+                error: function() {
+                    $('#bulk-status-text').html('⚠️ <strong>Atenção:</strong> Imagens convertidas, mas houve erro ao limpar links permanentes. Recomenda-se salvar manualmente em Configurações > Links Permanentes.');
+                    addLog('Erro ao tentar resetar links permanentes.', 'error');
+                }
+            });
+
             $('#btn-stop-bulk').hide();
             $('#btn-start-bulk').hide();
             addLog('Conversao total finalizada com sucesso.', 'success');
@@ -561,6 +684,21 @@ function conwebp_sanitize_legacy_suffixes( $file ) {
 // 4. LÓGICA PRINCIPAL (INTERCEPTAÇÃO DO UPLOAD)
 // ----------------------------------------------------
 
+/**
+ * Faz o WordPress priorizar o editor GD (que suporta WebP)
+ * antes do Imagick em todas as operações de imagem.
+ */
+add_filter( 'wp_image_editors', 'conwebp_prefer_gd_editor' );
+function conwebp_prefer_gd_editor( $editors ) {
+    if ( in_array( 'WP_Image_Editor_GD', $editors, true ) ) {
+        $editors = array_merge(
+            array( 'WP_Image_Editor_GD' ),
+            array_diff( $editors, array( 'WP_Image_Editor_GD' ) )
+        );
+    }
+    return $editors;
+}
+
 add_filter( 'upload_mimes', 'conwebp_allow_avif_uploads' );
 function conwebp_allow_avif_uploads( $mimes ) {
     if ( ! isset( $mimes['avif'] ) ) {
@@ -589,6 +727,7 @@ function conwebp_process_image_upload( $upload ) {
         return $upload;
     }
 
+    // Usa o editor padrão (já ajustado para priorizar GD via filtro)
     $editor = wp_get_image_editor( $file_path );
     if ( ! is_wp_error( $editor ) ) {
         $max_size = (int) get_option( 'conwebp_max_size', 1920 );
@@ -608,6 +747,11 @@ function conwebp_process_image_upload( $upload ) {
 
         $editor->set_quality( $quality );
         $saved = $editor->save( $new_file_path, 'image/webp' );
+
+        // Garante que o servidor realmente gerou WebP
+        if ( is_wp_error( $saved ) || empty( $saved['path'] ) || ( isset( $saved['mime-type'] ) && 'image/webp' !== $saved['mime-type'] ) ) {
+            return $upload; // Sem suporte real a WebP, não altera nada.
+        }
 
         if ( ! is_wp_error( $saved ) ) {
             $remove_originals = (int) get_option( 'conwebp_remove_originals', 1 );
@@ -633,10 +777,15 @@ function conwebp_handle_bulk_ajax() {
 
     $offset = isset( $_POST['offset'] ) ? intval( $_POST['offset'] ) : 0;
     $limit  = 5; // Processa 5 por vez pra não dar timeout em servidores lentos
+
+    // Filtros opcionais de ano/mês para reduzir o volume (evitar timeouts)
+    $year  = isset( $_POST['year'] ) ? intval( $_POST['year'] ) : 0;
+    $month = isset( $_POST['month'] ) ? intval( $_POST['month'] ) : 0;
     
     $args = array(
         'post_type'      => 'attachment',
-        'post_mime_type' => array( 'image/jpeg', 'image/png' ),
+        // Inclui variações comuns de JPEG/PNG (alguns servidores gravam como jfif/pjpeg/x-png)
+        'post_mime_type' => array( 'image/jpeg', 'image/jpg', 'image/png', 'image/jfif', 'image/pjpeg', 'image/x-png' ),
         'post_status'    => 'inherit',
         'posts_per_page' => $limit,
         'offset'         => $offset,
@@ -644,11 +793,18 @@ function conwebp_handle_bulk_ajax() {
         'order'          => 'DESC'
     );
 
-    $query = new WP_Query( $args );
+    if ( $year > 0 ) {
+        $args['year'] = $year;
+    }
+    if ( $month > 0 ) {
+        $args['monthnum'] = $month;
+    }
+
+    $query   = new WP_Query( $args );
     $results = array();
 
     if ( $query->have_posts() ) {
-        $quality         = (int) get_option( 'conwebp_quality', 80 );
+        $quality          = (int) get_option( 'conwebp_quality', 80 );
         $remove_originals = (int) get_option( 'conwebp_remove_originals', 1 );
         $update_links     = (int) get_option( 'conwebp_update_links', 1 );
         $update_postmeta  = (int) get_option( 'conwebp_update_postmeta', 0 );
@@ -664,28 +820,55 @@ function conwebp_handle_bulk_ajax() {
             }
 
             $info = pathinfo( $file );
-            if ( strtolower( $info['extension'] ) === 'webp' ) {
+            $ext  = isset( $info['extension'] ) ? strtolower( $info['extension'] ) : '';
+
+            // Pula se já for WebP
+            if ( $ext === 'webp' ) {
                 $results[] = array( 'status' => 'warning', 'msg' => "ID $id: Já é WebP. Pulado.", 'saved_bytes' => 0 );
+                continue;
+            }
+
+            // Pula formatos que não são JPEG/PNG (ex.: GIF, SVG, etc.), para evitar erro
+            if ( ! in_array( $ext, array( 'jpg', 'jpeg', 'png', 'jfif', 'jpe' ), true ) ) {
+                $results[] = array( 'status' => 'warning', 'msg' => "ID $id: Formato {$ext} não convertido (apenas JPG/PNG).", 'saved_bytes' => 0 );
                 continue;
             }
 
             // URL antiga do anexo, para atualizar links no banco
             $old_url = wp_get_attachment_url( $id );
 
+            // Usa o editor padrão (já priorizando GD via filtro)
             $editor = wp_get_image_editor( $file );
             if ( is_wp_error( $editor ) ) {
-                $results[] = array( 'status' => 'error', 'msg' => "ID $id: Erro ao abrir imagem.", 'saved_bytes' => 0 );
+                $results[] = array(
+                    'status'      => 'error',
+                    'msg'         => "ID $id: Erro ao abrir imagem (" . $editor->get_error_message() . ").",
+                    'saved_bytes' => 0,
+                );
                 continue;
             }
 
             $original_size = filesize( $file );
 
-            $new_file = $info['dirname'] . '/' . $info['filename'] . '.webp';
+            // Deixa o editor decidir o caminho/nome final e usa sempre o retorno
             $editor->set_quality( $quality );
-            $saved = $editor->save( $new_file, 'image/webp' );
+            $saved = $editor->save( null, 'image/webp' );
 
-            if ( ! is_wp_error( $saved ) ) {
-                // Update Metadata
+            // Se o servidor não suportar WebP, o editor pode salvar como JPG/PNG.
+            // Nesses casos, não vamos alterar o anexo nem remover original.
+            if ( is_wp_error( $saved ) || empty( $saved['path'] ) || ( isset( $saved['mime-type'] ) && 'image/webp' !== $saved['mime-type'] ) ) {
+                $results[] = array(
+                    'status'      => 'warning',
+                    'msg'         => "ID $id: Servidor sem suporte completo a WebP. Arquivo mantido em formato original.",
+                    'saved_bytes' => 0,
+                );
+                continue;
+            }
+
+            if ( ! is_wp_error( $saved ) && ! empty( $saved['path'] ) ) {
+                $new_file = $saved['path'];
+
+                // Update Metadata com o caminho real salvo no disco
                 update_attached_file( $id, $new_file );
                 
                 // Força o WP a regenerar as miniaturas no novo formato
@@ -698,7 +881,7 @@ function conwebp_handle_bulk_ajax() {
                     'post_mime_type'=> 'image/webp',
                 ) );
                 
-                $new_size   = filesize( $new_file );
+                $new_size   = @filesize( $new_file );
                 $saved_bytes = max( 0, $original_size - $new_size );
 
                 // Remove original apenas se configurado
@@ -706,10 +889,19 @@ function conwebp_handle_bulk_ajax() {
                     @unlink( $file );
                 }
 
-                // Atualiza URLs em posts e metadados, se desejado
-                $new_url = str_replace( $info['basename'], $info['filename'] . '.webp', $old_url );
+                // Atualiza URLs em posts e metadados, se desejado.
+                // Usa sempre a URL oficial do anexo após atualizar o arquivo.
+                $new_url = wp_get_attachment_url( $id );
                 if ( $update_links || $update_postmeta ) {
+                    // Versão com URL absoluta
                     conwebp_replace_urls_in_database( $old_url, $new_url, (bool) $update_links, (bool) $update_postmeta );
+
+                    // Versão apenas com o caminho (caso o conteúdo use URLs relativas)
+                    $old_path = parse_url( $old_url, PHP_URL_PATH );
+                    $new_path = parse_url( $new_url, PHP_URL_PATH );
+                    if ( $old_path && $new_path && $old_path !== $new_path ) {
+                        conwebp_replace_urls_in_database( $old_path, $new_path, (bool) $update_links, (bool) $update_postmeta );
+                    }
                 }
                 
                 $results[] = array( 'status' => 'success', 'msg' => "ID $id: Otimizado com sucesso (" . $info['basename'] . ")", 'saved_bytes' => $saved_bytes );
@@ -718,9 +910,20 @@ function conwebp_handle_bulk_ajax() {
             }
         }
         
-        wp_send_json_success( array( 'count' => $query->post_count, 'results' => $results ) );
+        // total é o total de anexos que se enquadram no filtro (para barra de progresso)
+        $total = isset( $query->found_posts ) ? intval( $query->found_posts ) : 0;
+
+        wp_send_json_success( array(
+            'count'   => $query->post_count,
+            'total'   => $total,
+            'results' => $results,
+        ) );
     } else {
-        wp_send_json_success( array( 'count' => 0, 'results' => array() ) );
+        wp_send_json_success( array(
+            'count'   => 0,
+            'total'   => 0,
+            'results' => array(),
+        ) );
     }
 }
 
@@ -910,5 +1113,21 @@ function conwebp_recursive_replace( $search, $replace, $data ) {
     }
 
     return $data;
+}
+
+// ----------------------------------------------------
+// 8. CORREÇÃO AUTOMÁTICA DE 404 (FLUSH REWRITE)
+// ----------------------------------------------------
+
+add_action( 'wp_ajax_conwebp_flush_rules', 'conwebp_handle_flush_rules_ajax' );
+function conwebp_handle_flush_rules_ajax() {
+    check_ajax_referer( 'conwebp_bulk_nonce', 'nonce' );
+    if ( ! current_user_can( 'manage_options' ) ) wp_send_json_error( 'Permissão negada.' );
+
+    // O WordPress as vezes se perde quando trocamos extensões JPEG/PNG -> WebP
+    // diretamente no banco de dados. O flush_rewrite_rules reconstrói o índice.
+    flush_rewrite_rules();
+
+    wp_send_json_success( 'Links permanentes resetados.' );
 }
 
